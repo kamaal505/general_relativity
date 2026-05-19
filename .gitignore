@@ -1,0 +1,9 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Runtime output folders (created by gr_calculator.py at execution time)
+output/
