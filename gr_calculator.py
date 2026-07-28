@@ -34,12 +34,26 @@ if hasattr(sys.stdout, "reconfigure"):
 
 MATH_NAMESPACE = {
     "sin": sp.sin, "cos": sp.cos, "tan": sp.tan,
+    "sec": sp.sec, "csc": sp.csc, "cot": sp.cot,
     "asin": sp.asin, "acos": sp.acos, "atan": sp.atan, "atan2": sp.atan2,
+    "asec": sp.asec, "acsc": sp.acsc, "acot": sp.acot,
+    "arcsin": sp.asin, "arccos": sp.acos, "arctan": sp.atan,
     "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
+    "sech": sp.sech, "csch": sp.csch, "coth": sp.coth,
+    "asinh": sp.asinh, "acosh": sp.acosh, "atanh": sp.atanh,
+    "arcsinh": sp.asinh, "arccosh": sp.acosh, "arctanh": sp.atanh,
     "exp": sp.exp, "log": sp.log, "ln": sp.log,
     "sqrt": sp.sqrt, "Abs": sp.Abs, "sign": sp.sign,
     "pi": sp.pi, "E": sp.E,
 }
+
+# Single-letter (and other short) names that collide with sympy's own
+# top-level globals — e.g. sympify("Q") returns sympy's assumptions object,
+# not a free symbol, unless we shadow it explicitly. These are exactly the
+# names GR/astrophysics users reach for constantly: Q (charge), I (moment of
+# inertia / current), N, O, S (entropy/action), C, etc. Anything not in this
+# set already sympifies to a plain Symbol, so shadowing everything bare is
+# the robust fix rather than trying to enumerate collisions individually.
 
 # Strips ANSI escape sequences (arrow keys, colour codes, etc.) that some
 # terminals inject into the input stream.
@@ -86,12 +100,21 @@ def _rewrite_power_funcs(expr_str: str) -> str:
     return "".join(result)
 
 
+_IDENT_RE = re.compile(r"\b[A-Za-z_]\w*\b")
+
+
 def sympify_smart(expr_str: str, coord_vars: dict) -> sp.Expr:
     """
     Parse expr_str as a sympy expression.
     - sin**2(x) style notation is rewritten to sin(x)**2 before parsing.
     - Identifiers in call position that are not built-ins are promoted to
       undefined sympy Functions so sympy can differentiate them symbolically.
+    - Every other bare identifier (constants like M, Q, a, S, ...) is forced
+      to a plain sympy Symbol. This matters because sympy's default global
+      namespace shadows several short names physicists use constantly —
+      Q, I, N, O, S, C, ... resolve to sympy internals (assumptions object,
+      imaginary unit, numeric-eval function, etc.) rather than free symbols
+      unless we pin them here.
     """
     expr_str  = _rewrite_power_funcs(expr_str)
     namespace = {**MATH_NAMESPACE, **coord_vars}
@@ -100,6 +123,11 @@ def sympify_smart(expr_str: str, coord_vars: dict) -> sp.Expr:
     for name in called:
         if name not in namespace:
             namespace[name] = sp.Function(name)
+
+    for name in set(_IDENT_RE.findall(expr_str)):
+        if name in called or name in namespace:
+            continue
+        namespace[name] = sp.Symbol(name)
 
     return sp.sympify(expr_str, locals=namespace)
 
@@ -247,6 +275,15 @@ def compute_ricci_scalar(Ric: list, g_inv: sp.Matrix, n: int) -> sp.Expr:
     return simplify(R_scalar)
 
 
+def compute_einstein_tensor(Ric: list, R_scalar: sp.Expr, g: sp.Matrix, n: int) -> list:
+    """G_mu_nu = R_mu_nu - (1/2) R g_mu_nu"""
+    G = [[sp.Integer(0)] * n for _ in range(n)]
+    for mu in range(n):
+        for nu in range(n):
+            G[mu][nu] = simplify(Ric[mu][nu] - Rational(1, 2) * R_scalar * g[mu, nu])
+    return G
+
+
 # ---------------------------------------------------------------------------
 # Plain-text output
 # ---------------------------------------------------------------------------
@@ -313,6 +350,17 @@ def format_ricci_scalar(R_scalar: sp.Expr) -> str:
     return "\n".join(lines)
 
 
+def format_einstein_tensor(G: list, n: int) -> str:
+    lines = [section("EINSTEIN TENSOR")]
+    lines.append("  Convention:  G_mu_nu = R_mu_nu - (1/2) R g_mu_nu\n")
+    lines.append("  All components (including zeros):\n")
+    for mu in range(n):
+        for nu in range(n):
+            lines.append(f"    G_{mu}{nu} = {G[mu][nu]}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def save(content: str, path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -345,6 +393,7 @@ def generate_latex(
     R: list,
     Ric: list,
     R_scalar: sp.Expr,
+    G: list,
     coords: list,
     n: int,
 ) -> str:
@@ -479,6 +528,28 @@ def generate_latex(
     ]
     L += _dmath("R", R_scalar)
 
+    # ------ Einstein tensor ------
+    L += [
+        r"\section{Einstein Tensor}",
+        r"\textbf{Convention:} $G_{\mu\nu} = R_{\mu\nu} - \frac{1}{2}R\,g_{\mu\nu}$",
+        r"\textbf{Non-zero components:}",
+    ]
+
+    any_nz = False
+    for mu in range(n):
+        for nu in range(n):
+            val = G[mu][nu]
+            if val != 0:
+                any_nz = True
+                lhs = "G_{" + ci(mu) + ci(nu) + "}"
+                L += _dmath(lhs, val)
+
+    L.append(
+        r"\textit{All remaining components are zero.}"
+        if any_nz else
+        r"\textit{All Einstein tensor components vanish (vacuum solution).}"
+    )
+
     L.append(r"\end{document}")
     return "\n".join(L)
 
@@ -556,6 +627,7 @@ def main() -> None:
     R        = compute_riemann(Gamma, coords, n)
     Ric      = compute_ricci_tensor(R, n)
     R_scalar = compute_ricci_scalar(Ric, g_inv, n)
+    G        = compute_einstein_tensor(Ric, R_scalar, g, n)
 
     print(THIN)
     print("  Saving output files...\n")
@@ -565,9 +637,10 @@ def main() -> None:
     save(format_riemann(R, n),          os.path.join(out_dir, "riemann.txt"))
     save(format_ricci_tensor(Ric, n),   os.path.join(out_dir, "ricci_tensor.txt"))
     save(format_ricci_scalar(R_scalar), os.path.join(out_dir, "ricci_scalar.txt"))
+    save(format_einstein_tensor(G, n),  os.path.join(out_dir, "einstein_tensor.txt"))
 
     tex_path = os.path.join(out_dir, "results.tex")
-    save(generate_latex(g, Gamma, R, Ric, R_scalar, coords, n), tex_path)
+    save(generate_latex(g, Gamma, R, Ric, R_scalar, G, coords, n), tex_path)
 
     print()
     compile_pdf(tex_path, out_dir)
@@ -575,7 +648,7 @@ def main() -> None:
     print(f"\n{DIVIDER}")
     print("  All done! Files written to:")
     print(f"    {out_dir}")
-    print(f"    .txt: metric | christoffel | riemann | ricci_tensor | ricci_scalar")
+    print(f"    .txt: metric | christoffel | riemann | ricci_tensor | ricci_scalar | einstein_tensor")
     print(f"    .tex: results.tex  (+ results.pdf if pdflatex was found)")
     print(DIVIDER)
     print()
